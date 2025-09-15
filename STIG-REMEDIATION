@@ -1,0 +1,64 @@
+<#
+.SYNOPSIS
+    This PowerShell script ensures that the maximum size of the Windows Application event log 
+    is at least 32768 KB (32 MB).
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : https://www.linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : https://github.com/jfsaravia
+    Date Created    : 2025-09-15
+    Last Modified   : 2025-09-15
+    Version         : 1.1
+    CVEs            : N/A
+
+.Plugin IDs
+    Tenable Plugin  : 21156 (Windows Compliance Checks)
+    Audit File      : DISA Microsoft Windows 10 STIG v3r4
+    STIG ID         : WN10-AU-000500
+    Vuln ID         : V-220779
+    CCI             : CCI-001849
+
+.TESTED ON
+    Date(s) Tested  : 2025-09-11
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro (22H2), Windows 11 Pro (23H2)
+    PowerShell Ver. : 5.1, 7.4
+
+.USAGE
+    Run this script in an elevated PowerShell session (Run as Administrator). 
+    It will create or correct the "MaxSize" value under the Application Event Log registry key.
+    If the value already exists with the correct size, no changes are made.
+
+    Example syntax:
+        PS C:\> .\Set-EventLogMaxSize.ps1
+
+    Optional usage:
+        - Save the script in a centralized repository for compliance or remediation tasks.
+        - Deploy via Intune, SCCM, or Group Policy as part of your hardening baseline.
+#>
+
+# Enforces Windows Application Event Log MaxSize registry setting (STIG WN10-AU-000500)
+
+$regPath   = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Application"
+$valueName = "MaxSize"
+$valueData = 0x00032768  # Decimal: 208,896 (32 MB)
+
+# Ensure the registry path exists
+if (-not (Test-Path $regPath)) {
+    New-Item -Path $regPath -Force | Out-Null
+}
+
+# Check, create, or correct the value
+$currentValue = (Get-ItemProperty -Path $regPath -Name $valueName -ErrorAction SilentlyContinue).$valueName
+if ($null -eq $currentValue) {
+    New-ItemProperty -Path $regPath -Name $valueName -Value $valueData -PropertyType DWord -Force | Out-Null
+    Write-Output "Registry value created: $regPath\$valueName = $valueData"
+}
+elseif ($currentValue -ne $valueData) {
+    Set-ItemProperty -Path $regPath -Name $valueName -Value $valueData
+    Write-Output "Registry value updated: $regPath\$valueName corrected to $valueData"
+}
+else {
+    Write-Output "Registry value already set correctly."
+}
