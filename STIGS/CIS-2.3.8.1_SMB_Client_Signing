@@ -1,0 +1,162 @@
+<#
+.SYNOPSIS
+    Enforce or revert the CIS Benchmark control 2.3.8.1 (L1):
+    "Microsoft network client: Digitally sign communications (always)".
+    This sets the SMB client registry value RequireSecuritySignature to 1 (enable) by default,
+    or to 0 when -Revert is used. Script is idempotent, verifies changes, and logs locally
+    and to Windows Event Log.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/jfsaravia
+    Date Created    : 2025-10-06
+    Last Modified   : 2025-10-06
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable Audit Control: CIS Microsoft Windows 10 vX 2.3.8.1
+    STIG-ID         : N/A (CIS 2.3.8.1 control)
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-06
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows Server 2019 Datacenter
+    PowerShell Ver. : 5.1
+
+.USAGE
+    Run in an elevated PowerShell session.
+
+    Examples:
+      PS C:\> .\Set-SMBClientSigningAlways.ps1
+      PS C:\> .\Set-SMBClientSigningAlways.ps1 -Revert
+      PS C:\> .\Set-SMBClientSigningAlways.ps1 -EventSource "Corp-SMBSigning" -EventLog "Application" -LogPath "C:\ProgramData\Corp\SMBSigning.log"
+
+    Tenable verification:
+      After running and rebooting, rerun your authenticated scan. Tenable checks:
+      HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters\RequireSecuritySignature = 1
+#>
+
+param(
+  [switch]$Revert,
+  [string]$EventSource = "SMBClientSigning",
+  [string]$EventLog = "Application",
+  [string]$LogPath = "$env:ProgramData\SMBClientSigning-Remediation.log"
+)
+
+# Admin check
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+# Target registry info
+$RegPath   = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'
+$ValueName = 'RequireSecuritySignature'
+$Desired   = if ($Revert) { 0 } else { 1 }
+
+# Simple file logger
+function Write-FileLog {
+  param([string]$Message)
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts  $Message" | Tee-Object -FilePath $LogPath -Append | Out-Null
+}
+
+# Ensure Windows Event Log source exists
+function Ensure-EventSource {
+  param([string]$Source, [string]$LogName)
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) {
+      New-EventLog -LogName $LogName -Source $Source -ErrorAction Stop
+    }
+  } catch {
+    Write-FileLog "Warning: Could not create event source '$Source' in log '$LogName'. $_"
+  }
+}
+
+# Write event wrapper
+function Write-CentralEvent {
+  param(
+    [int]$EventId,
+    [ValidateSet("Information","Warning","Error")]
+    [string]$EntryType = "Information",
+    [string]$Message
+  )
+  try {
+    Write-EventLog -LogName $EventLog -Source $EventSource -EventId $EventId -EntryType $EntryType -Message $Message
+  } catch {
+    Write-FileLog "Warning: Failed to write event $EventId. $_"
+  }
+}
+
+# Read current registry value
+function Get-CurrentValue {
+  try {
+    if (Test-Path $RegPath) {
+      return (Get-ItemProperty -Path $RegPath -Name $ValueName -ErrorAction Stop).$ValueName
+    }
+  } catch { }
+  return $null
+}
+
+# Set required registry value
+function Set-RequiredValue {
+  param([int]$Value)
+  if (-not (Test-Path $RegPath)) {
+    New-Item -Path $RegPath -Force | Out-Null
+  }
+  New-ItemProperty -Path $RegPath -Name $ValueName -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+# Begin
+Ensure-EventSource -Source $EventSource -LogName $EventLog
+Write-FileLog "Starting SMB client signing remediation. Revert=$Revert Desired=$Desired"
+Write-CentralEvent -EventId 1000 -EntryType Information -Message "Starting SMB client signing remediation. Revert=$Revert Desired=$Desired"
+
+try {
+  $current = Get-CurrentValue
+  if ($null -ne $current) {
+    Write-FileLog "Current value: $ValueName=$current"
+  } else {
+    Write-FileLog "Current value not present."
+  }
+
+  if ($current -eq $Desired) {
+    $state = if ($Desired -eq 1) { "Enabled" } else { "Disabled" }
+    $msg = "Already compliant. $ValueName is $Desired ($state). No change required."
+    Write-FileLog $msg
+    Write-Host $msg
+    Write-CentralEvent -EventId 1001 -EntryType Information -Message $msg
+    exit 0
+  }
+
+  Set-RequiredValue -Value $Desired
+  $verify = Get-CurrentValue
+
+  if ($verify -eq $Desired) {
+    $state = if ($Desired -eq 1) { "Enabled" } else { "Disabled" }
+    $msg = "Remediation success. Set $ValueName=$Desired ($state). Reboot is recommended so all SMB sessions pick up the setting."
+    Write-FileLog $msg
+    Write-Host $msg
+    $eid = if ($Desired -eq 1) { 1100 } else { 1101 }
+    Write-CentralEvent -EventId $eid -EntryType Information -Message $msg
+    exit 0
+  } else {
+    $msg = "Verification failed. Expected $Desired but found $verify."
+    Write-FileLog $msg
+    Write-Error $msg
+    Write-CentralEvent -EventId 1200 -EntryType Error -Message $msg
+    exit 2
+  }
+}
+catch {
+  $msg = "Unhandled error: $($_.Exception.Message)"
+  Write-FileLog $msg
+  Write-Error $msg
+  Write-CentralEvent -EventId 1300 -EntryType Error -Message $msg
+  exit 3
+}
+finally {
+  Write-FileLog "Finished remediation attempt."
+  Write-CentralEvent -EventId 1002 -EntryType Information -Message "Finished remediation attempt."
+}
