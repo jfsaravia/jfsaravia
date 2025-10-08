@@ -1,0 +1,173 @@
+<#
+.SYNOPSIS
+    Configure the WinRM policy "Disallow WinRM from storing RunAs credentials".
+
+.DESCRIPTION
+    This script sets the registry equivalent of the GPO setting:
+    Computer Configuration\Administrative Templates\Windows Components\Windows Remote Management (WinRM)\WinRM Service\Disallow WinRM from storing RunAs credentials
+
+    Registry:
+      HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service
+      Name: DisableRunAs (REG_DWORD)
+      Enabled  -> 1
+      Disabled -> 0
+      Not Configured -> value deleted
+
+.PARAMETER State
+    Target state for the setting. One of: Enabled, Disabled, NotConfigured.
+
+.PARAMETER Backup
+    Exports the current registry key to a .reg file in the script folder with a timestamp.
+
+.PARAMETER WhatIf
+    Shows what would change without making changes.
+
+.PARAMETER Confirm
+    Prompts for confirmation before changing values.
+
+.EXAMPLE
+    # Enable the setting (compliant)
+    .\Remediate-WinRM-DisableRunAs.ps1 -State Enabled
+
+.EXAMPLE
+    # Revert to Not Configured
+    .\Remediate-WinRM-DisableRunAs.ps1 -State NotConfigured
+
+.EXAMPLE
+    # Disable the setting (noncompliant for CIS L1)
+    .\Remediate-WinRM-DisableRunAs.ps1 -State Disabled -Confirm
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-10-07
+    Last Modified   : 2025-10-08
+    Version         : 1.0
+    CIS Control     : 18.10.88.2.4 (L1)
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-08
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows (Windows Server 2019 Datacenter)
+    PowerShell Ver. : 5.1 and 7.x
+
+.USAGE
+    Run in an elevated PowerShell session.
+    Typical compliance action:
+      PS C:\> .\Remediate-WinRM-DisableRunAs.ps1 -State Enabled
+
+    To revert registry edit later, run:
+      PS C:\> .\Remediate-WinRM-DisableRunAs.ps1 -State NotConfigured
+
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Enabled','Disabled','NotConfigured')]
+    [string]$State,
+
+    [switch]$Backup
+)
+
+function Write-Info($msg)  { Write-Host "[INFO]  $msg" }
+function Write-Ok($msg)    { Write-Host "[OK]    $msg" -ForegroundColor Green }
+function Write-Warn($msg)  { Write-Warning $msg }
+function Write-Err($msg)   { Write-Host "[ERROR] $msg" -ForegroundColor Red }
+
+$baseKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM'
+$svcKey  = Join-Path $baseKey 'Service'
+$valueName = 'DisableRunAs'
+
+try {
+    # Ensure running elevated
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "This script must be run as Administrator."
+    }
+
+    Write-Info "Target state: $State"
+    Write-Info "Registry path: $svcKey"
+    Write-Info "Value name: $valueName"
+
+    # Backup current key if requested
+    if ($Backup) {
+        $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $backupFile = Join-Path $PSScriptRoot "WinRM_Service_Backup_$ts.reg"
+        $regPathForExport = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM'
+        Write-Info "Backing up registry key to: $backupFile"
+        reg.exe export $regPathForExport $backupFile /y | Out-Null
+        if (Test-Path $backupFile) { Write-Ok "Backup created." } else { Write-Warn "Backup did not create." }
+    }
+
+    # Make sure the path exists for Enabled/Disabled states
+    if ($State -ne 'NotConfigured') {
+        if (-not (Test-Path $baseKey)) {
+            if ($PSCmdlet.ShouldProcess($baseKey, "Create")) {
+                New-Item -Path $baseKey -Force | Out-Null
+            }
+        }
+        if (-not (Test-Path $svcKey)) {
+            if ($PSCmdlet.ShouldProcess($svcKey, "Create")) {
+                New-Item -Path $svcKey -Force | Out-Null
+            }
+        }
+    }
+
+    switch ($State) {
+        'Enabled' {
+            $targetValue = 1
+            if ($PSCmdlet.ShouldProcess("$svcKey\$valueName", "Set to $targetValue")) {
+                New-ItemProperty -Path $svcKey -Name $valueName -PropertyType DWord -Value $targetValue -Force | Out-Null
+                Write-Ok "Set DisableRunAs = 1 (Enabled)."
+            }
+        }
+        'Disabled' {
+            $targetValue = 0
+            if ($PSCmdlet.ShouldProcess("$svcKey\$valueName", "Set to $targetValue")) {
+                New-ItemProperty -Path $svcKey -Name $valueName -PropertyType DWord -Value $targetValue -Force | Out-Null
+                Write-Ok "Set DisableRunAs = 0 (Disabled)."
+            }
+        }
+        'NotConfigured' {
+            if (Test-Path $svcKey) {
+                if (Get-ItemProperty -Path $svcKey -Name $valueName -ErrorAction SilentlyContinue) {
+                    if ($PSCmdlet.ShouldProcess("$svcKey\$valueName", "Delete")) {
+                        Remove-ItemProperty -Path $svcKey -Name $valueName -ErrorAction SilentlyContinue
+                        Write-Ok "Deleted value. Setting is Not Configured."
+                    }
+                } else {
+                    Write-Info "Value not present. Already Not Configured."
+                }
+            } else {
+                Write-Info "Key not present. Already Not Configured."
+            }
+        }
+    }
+
+    # Verification
+    Write-Info "Verifying current state..."
+    $current = $null
+    if (Test-Path $svcKey) {
+        $prop = Get-ItemProperty -Path $svcKey -Name $valueName -ErrorAction SilentlyContinue
+        if ($null -ne $prop) { $current = [int]$prop.$valueName }
+    }
+
+    switch ($State) {
+        'Enabled' {
+            if ($current -eq 1) { Write-Ok "Verification passed. DisableRunAs = 1" } else { Write-Err "Verification failed." }
+        }
+        'Disabled' {
+            if ($current -eq 0) { Write-Ok "Verification passed. DisableRunAs = 0" } else { Write-Err "Verification failed." }
+        }
+        'NotConfigured' {
+            if ($null -eq $current) { Write-Ok "Verification passed. Value not present." } else { Write-Err "Verification failed." }
+        }
+    }
+
+} catch {
+    Write-Err $_.Exception.Message
+    exit 1
+}
