@@ -1,0 +1,163 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN10-CC-000110: "Printing over HTTP must be prevented."
+    Sets HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\DisableHTTPPrinting = 1 (Enabled).
+    Includes -Revert to set the value to 0 (Disabled), plus logging and Windows Event Log entries.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-10-9
+    Last Modified   : 2025-10-13
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable STIG audit item for WN10-CC-000110 (V-220817)
+    STIG-ID         : WN10-CC-000110 (Printing over HTTP must be prevented)
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-14
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro 22H2
+    PowerShell Ver. : 5.1
+
+.USAGE
+    Run in an elevated PowerShell session.
+
+    Enforce (disable HTTP printing):
+      PS C:\> .\Set-DisableHTTPPrinting.ps1
+
+    Revert (allow HTTP printing):
+      PS C:\> .\Set-DisableHTTPPrinting.ps1 -Revert
+
+    Verification (registry):
+      PS C:\> reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Printers" /v DisableHTTPPrinting
+#>
+
+param(
+  [switch]$Revert,
+  [string]$EventSource = "STIG-WN10-CC-000110",
+  [string]$EventLog = "Application",
+  [string]$LogPath = "$env:ProgramData\STIG-WN10-CC-000110.log"
+)
+
+# Exit codes:
+# 0 = Success/compliant, 1 = Not elevated, 2 = Verification failed, 3 = Unhandled error
+
+# Admin check
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+# Target policy registry (Computer Configuration > Administrative Templates > Printers)
+$RegPath   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'
+$ValueName = 'DisableHTTPPrinting'
+$Desired   = if ($Revert) { 0 } else { 1 }
+
+# Simple file logger
+function Write-FileLog {
+  param([string]$Message)
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts  $Message" | Tee-Object -FilePath $LogPath -Append | Out-Null
+}
+
+# Ensure Windows Event Log source exists
+function Ensure-EventSource {
+  param([string]$Source, [string]$LogName)
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) {
+      New-EventLog -LogName $LogName -Source $Source -ErrorAction Stop
+    }
+  } catch {
+    Write-FileLog "Warning: Could not create event source '$Source' in log '$LogName'. $_"
+  }
+}
+
+# Write event wrapper
+function Write-CentralEvent {
+  param(
+    [int]$EventId,
+    [ValidateSet("Information","Warning","Error")]
+    [string]$EntryType = "Information",
+    [string]$Message
+  )
+  try {
+    Write-EventLog -LogName $EventLog -Source $EventSource -EventId $EventId -EntryType $EntryType -Message $Message
+  } catch {
+    Write-FileLog "Warning: Failed to write event $EventId. $_"
+  }
+}
+
+# Read current registry value
+function Get-CurrentValue {
+  try {
+    if (Test-Path $RegPath) {
+      return (Get-ItemProperty -Path $RegPath -Name $ValueName -ErrorAction Stop).$ValueName
+    }
+  } catch { }
+  return $null
+}
+
+# Set required registry value
+function Set-RequiredValue {
+  param([int]$Value)
+  if (-not (Test-Path $RegPath)) {
+    New-Item -Path $RegPath -Force | Out-Null
+  }
+  New-ItemProperty -Path $RegPath -Name $ValueName -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+# Begin
+Ensure-EventSource -Source $EventSource -LogName $EventLog
+Write-FileLog "Starting remediation for WN10-CC-000110. Revert=$Revert Desired=$Desired"
+Write-CentralEvent -EventId 1000 -EntryType Information -Message "Start WN10-CC-000110. Revert=$Revert Desired=$Desired"
+
+try {
+  $current = Get-CurrentValue
+  if ($null -ne $current) {
+    Write-FileLog "Current $ValueName=$current"
+  } else {
+    Write-FileLog "Current $ValueName not present."
+  }
+
+  if ($current -eq $Desired) {
+    $state = if ($Desired -eq 1) { "Disabled HTTP printing (compliant)" } else { "Allowed HTTP printing (reverted)" }
+    $msg = "Already compliant. $ValueName is $Desired ($state). No change required."
+    Write-FileLog $msg
+    Write-Host $msg
+    Write-CentralEvent -EventId 1001 -EntryType Information -Message $msg
+    exit 0
+  }
+
+  Set-RequiredValue -Value $Desired
+  $verify = Get-CurrentValue
+
+  if ($verify -eq $Desired) {
+    $state = if ($Desired -eq 1) { "Disabled HTTP printing (compliant)" } else { "Allowed HTTP printing (reverted)" }
+    $msg = "Remediation success. Set $ValueName=$Desired ($state). A gpupdate /force or reboot will ensure policy applies everywhere."
+    Write-FileLog $msg
+    Write-Host $msg
+    $eid = if ($Desired -eq 1) { 1100 } else { 1101 }
+    Write-CentralEvent -EventId $eid -EntryType Information -Message $msg
+    exit 0
+  } else {
+    $msg = "Verification failed. Expected $Desired but found $verify."
+    Write-FileLog $msg
+    Write-Error $msg
+    Write-CentralEvent -EventId 1200 -EntryType Error -Message $msg
+    exit 2
+  }
+}
+catch {
+  $msg = "Unhandled error: $($_.Exception.Message)"
+  Write-FileLog $msg
+  Write-Error $msg
+  Write-CentralEvent -EventId 1300 -EntryType Error -Message $msg
+  exit 3
+}
+finally {
+  Write-FileLog "Finished remediation attempt."
+  Write-CentralEvent -EventId 1002 -EntryType Information -Message "Finished remediation attempt."
+}
