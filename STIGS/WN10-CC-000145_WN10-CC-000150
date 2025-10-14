@@ -1,0 +1,215 @@
+<#
+.SYNOPSIS
+    Remediate STIGs WN10-CC-000145 (on battery) and WN10-CC-000150 (plugged in):
+    "Require a password when a computer wakes" = Enabled.
+    Sets under HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51:
+      - DCSettingIndex = 1 (on battery)
+      - ACSettingIndex = 1 (plugged in)
+    Includes -Revert to set the values to 0, logging, and optional -SyncActivePlan to apply to current power plan.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-10-10
+    Last Modified   : 2025-10-12
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable STIG audit items for WN10-CC-000145 (V-220821) and WN10-CC-000150 (V-220822)
+    STIG-ID         : WN10-CC-000145 (battery), WN10-CC-000150 (AC)
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-14
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro 22H2
+    PowerShell Ver. : 5.1
+
+.USAGE
+    Run in an elevated PowerShell session.
+
+    Enforce both (set to Enabled):
+      PS C:\> .\Set-RequirePasswordOnWake.ps1
+
+    Revert both (set to Disabled):
+      PS C:\> .\Set-RequirePasswordOnWake.ps1 -Revert
+
+    Only AC or only Battery:
+      PS C:\> .\Set-RequirePasswordOnWake.ps1 -Scope AC
+      PS C:\> .\Set-RequirePasswordOnWake.ps1 -Scope Battery
+
+    Also sync current power plan via powercfg:
+      PS C:\> .\Set-RequirePasswordOnWake.ps1 -SyncActivePlan
+      PS C:\> .\Set-RequirePasswordOnWake.ps1 -Scope AC -SyncActivePlan
+
+    Tenable verification:
+      Check that these exist and equal 1:
+        HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51\ACSettingIndex
+        HKLM\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51\DCSettingIndex
+#>
+
+param(
+  [ValidateSet('Both','AC','Battery')]
+  [string]$Scope = 'Both',
+  [switch]$Revert,
+  [switch]$SyncActivePlan,
+  [string]$EventSource = "STIG-WN10-CC-000145_150",
+  [string]$EventLog = "Application",
+  [string]$LogPath = "$env:ProgramData\STIG-WN10-CC-000145_150.log"
+)
+
+# Exit codes:
+# 0 = Success/compliant, 1 = Not elevated, 2 = Verification failed, 3 = Unhandled error
+
+# Admin check
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+# Policy registry (Computer Configuration > System > Power Management > Sleep Settings)
+$RegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51'
+$Desired = if ($Revert) { 0 } else { 1 }
+
+# Simple file logger
+function Write-FileLog {
+  param([string]$Message)
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts  $Message" | Tee-Object -FilePath $LogPath -Append | Out-Null
+}
+
+# Ensure Event Log source
+function Ensure-EventSource {
+  param([string]$Source, [string]$LogName)
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) {
+      New-EventLog -LogName $LogName -Source $Source -ErrorAction Stop
+    }
+  } catch {
+    Write-FileLog "Warning: Could not create event source '$Source' in log '$LogName'. $_"
+  }
+}
+
+# Event wrapper
+function Write-CentralEvent {
+  param(
+    [int]$EventId,
+    [ValidateSet("Information","Warning","Error")]
+    [string]$EntryType = "Information",
+    [string]$Message
+  )
+  try {
+    Write-EventLog -LogName $EventLog -Source $EventSource -EventId $EventId -EntryType $EntryType -Message $Message
+  } catch {
+    Write-FileLog "Warning: Failed to write event $EventId. $_"
+  }
+}
+
+# Helpers
+function Ensure-Key { if (-not (Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null } }
+
+function Get-Value {
+  param([string]$Name)
+  try {
+    if (Test-Path $RegPath) { return (Get-ItemProperty -Path $RegPath -Name $Name -ErrorAction Stop).$Name }
+  } catch { }
+  return $null
+}
+
+function Set-Value {
+  param([string]$Name, [int]$Value)
+  Ensure-Key
+  New-ItemProperty -Path $RegPath -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+function Sync-Plan {
+  param([string]$Target, [int]$Value) # Target: 'AC' or 'Battery'
+  try {
+    if ($Target -eq 'AC') {
+      $args1 = "/SETACVALUEINDEX SCHEME_CURRENT SUB_NONE CONSOLELOCK $Value"
+      Write-FileLog "Running: powercfg $args1"
+      $p = Start-Process -FilePath powercfg.exe -ArgumentList $args1 -Wait -PassThru -WindowStyle Hidden
+      if ($p.ExitCode -ne 0) { throw "powercfg returned exit code $($p.ExitCode) for AC" }
+    } elseif ($Target -eq 'Battery') {
+      $args2 = "/SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE CONSOLELOCK $Value"
+      Write-FileLog "Running: powercfg $args2"
+      $p2 = Start-Process -FilePath powercfg.exe -ArgumentList $args2 -Wait -PassThru -WindowStyle Hidden
+      if ($p2.ExitCode -ne 0) { throw "powercfg returned exit code $($p2.ExitCode) for DC" }
+    }
+    $args3 = "/SETACTIVE SCHEME_CURRENT"
+    Write-FileLog "Running: powercfg $args3"
+    $p3 = Start-Process -FilePath powercfg.exe -ArgumentList $args3 -Wait -PassThru -WindowStyle Hidden
+    if ($p3.ExitCode -ne 0) { throw "powercfg returned exit code $($p3.ExitCode) on SETACTIVE" }
+  } catch {
+    Write-FileLog "Warning: SyncActivePlan for $Target failed. $_"
+    Write-CentralEvent -EventId 1400 -EntryType Warning -Message "SyncActivePlan for $Target failed. $_"
+  }
+}
+
+# Begin
+Ensure-EventSource -Source $EventSource -LogName $EventLog
+Write-FileLog "Start WN10-CC-000145/000150. Revert=$Revert Desired=$Desired Scope=$Scope SyncActivePlan=$SyncActivePlan"
+Write-CentralEvent -EventId 1000 -EntryType Information -Message "Start WN10-CC-000145/000150. Revert=$Revert Desired=$Desired Scope=$Scope SyncActivePlan=$SyncActivePlan"
+
+try {
+  $targets = switch ($Scope) {
+    'AC'      { @('ACSettingIndex') }
+    'Battery' { @('DCSettingIndex') }
+    default   { @('ACSettingIndex','DCSettingIndex') }
+  }
+
+  $allCompliant = $true
+
+  foreach ($name in $targets) {
+    $current = Get-Value -Name $name
+    if ($null -ne $current) {
+      Write-FileLog "Current $name=$current"
+    } else {
+      Write-FileLog "Current $name not present."
+    }
+
+    if ($current -ne $Desired) {
+      Set-Value -Name $name -Value $Desired
+      $verify = Get-Value -Name $name
+      if ($verify -eq $Desired) {
+        Write-FileLog "Set $name=$Desired OK"
+      } else {
+        Write-FileLog "Verification failed for $name. Expected $Desired, found $verify"
+        $allCompliant = $false
+      }
+    } else {
+      Write-FileLog "$name already $Desired (compliant)"
+    }
+  }
+
+  if (-not $allCompliant) {
+    $msg = "Verification failed on one or more values under $RegPath."
+    Write-Error $msg
+    Write-CentralEvent -EventId 1200 -EntryType Error -Message $msg
+    exit 2
+  }
+
+  if ($SyncActivePlan) {
+    if ($Scope -in @('Both','AC')) { Sync-Plan -Target 'AC' -Value $Desired }
+    if ($Scope -in @('Both','Battery')) { Sync-Plan -Target 'Battery' -Value $Desired }
+  }
+
+  $state = if ($Desired -eq 1) { "Enabled" } else { "Disabled" }
+  $msg2 = "Remediation success. ACSettingIndex/DCSettingIndex set to $Desired ($state) per scope '$Scope'. A gpupdate /force or reboot ensures policy applies everywhere."
+  Write-Host $msg2
+  Write-FileLog $msg2
+  $eid = if ($Desired -eq 1) { 1100 } else { 1101 }
+  Write-CentralEvent -EventId $eid -EntryType Information -Message $msg2
+  exit 0
+}
+catch {
+  $msg = "Unhandled error: $($_.Exception.Message)"
+  Write-FileLog $msg
+  Write-Error $msg
+  Write-CentralEvent -EventId 1300 -EntryType Error -Message $msg
+  exit 3
+}
+finally {
+  Write-FileLog "Finished remediation attempt."
+  Write-CentralEvent -EventId 1002 -EntryType Information -Message "Finished remediation attempt."
+}
