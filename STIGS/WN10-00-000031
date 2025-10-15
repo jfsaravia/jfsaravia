@@ -1,0 +1,148 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN10-00-000031 (Windows 10: require BitLocker pre-boot auth with TPM+PIN or TPM+Key+PIN).
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/jfsaravia
+    Date Created    : 2025-10-10
+    Last Modified   : 2025-10-13
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable STIG audit for WN10-00-000031 (V-220703)
+    STIG-ID         : WN10-00-000031
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-15
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro 22H2
+    PowerShell Ver. : 5.1+
+
+.USAGE
+    # Require TPM + PIN (default)
+    PS C:\> .\Set-BitLocker-PrebootAuth.ps1
+
+    # Require TPM + Key + PIN
+    PS C:\> .\Set-BitLocker-PrebootAuth.ps1 -Mode 'Key+PIN'
+
+    # Allow Enhanced PINs and set a minimum PIN length (optional best-practice)
+    PS C:\> .\Set-BitLocker-PrebootAuth.ps1 -EnableEnhancedPIN -MinimumPIN 6
+
+    # If Network Unlock is used in your environment (special case)
+    PS C:\> .\Set-BitLocker-PrebootAuth.ps1 -NetworkUnlock
+
+    # Revert policy (disable the requirement)
+    PS C:\> .\Set-BitLocker-PrebootAuth.ps1 -Revert
+
+    # Notes:
+    # - This configures policy (registry). To actually add a startup PIN on an already-encrypted OS drive, run later:
+    #     manage-bde -protectors -add C: -TPMAndPIN
+    #   or for key+PIN:
+    #     manage-bde -protectors -add C: -TPMAndPIN -rp
+#>
+
+param(
+  [ValidateSet('TPM+PIN','Key+PIN')]
+  [string]$Mode = 'TPM+PIN',
+
+  [switch]$EnableEnhancedPIN,
+  [ValidateRange(4,20)][int]$MinimumPIN = 6,
+
+  [switch]$NetworkUnlock,   # Use only if you actually deploy BitLocker Network Unlock
+  [switch]$Revert
+)
+
+# Admin required
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+$RegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
+
+# Helper: ensure key
+if (-not (Test-Path $RegPath)) {
+  New-Item -Path $RegPath -Force | Out-Null
+}
+
+function Set-Dword {
+  param([string]$Name,[int]$Value)
+  New-ItemProperty -Path $RegPath -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+function Get-Dword {
+  param([string]$Name)
+  try { (Get-ItemProperty -Path $RegPath -Name $Name -ErrorAction Stop).$Name } catch { $null }
+}
+
+try {
+  if ($Revert) {
+    # Disable “Require additional authentication at startup” and clear specifics
+    Set-Dword -Name 'UseAdvancedStartup' -Value 0
+    Set-Dword -Name 'UseTPMPIN'          -Value 0
+    Set-Dword -Name 'UseTPMKeyPIN'       -Value 0
+    Set-Dword -Name 'UseEnhancedPin'     -Value 0
+    # Don’t force MinimumPIN on revert
+    Write-Host "Reverted BitLocker pre-boot authentication policy (WN10-00-000031)."
+    exit 0
+  }
+
+  # Always enable the umbrella policy
+  Set-Dword -Name 'UseAdvancedStartup' -Value 1
+
+  # Reset option toggles to safe defaults before applying chosen mode
+  Set-Dword -Name 'UseTPMPIN'    -Value 0
+  Set-Dword -Name 'UseTPMKeyPIN' -Value 0
+
+  if ($NetworkUnlock) {
+    # When Network Unlock is used, PIN cannot be strictly required; set to Allow (2)
+    # and do not require Key+PIN
+    Set-Dword -Name 'UseTPMPIN'    -Value 2
+    Set-Dword -Name 'UseTPMKeyPIN' -Value 0
+  } else {
+    switch ($Mode) {
+      'TPM+PIN'  { Set-Dword -Name 'UseTPMPIN'    -Value 1 } # Require startup PIN with TPM
+      'Key+PIN'  { Set-Dword -Name 'UseTPMKeyPIN' -Value 1 } # Require startup key and PIN with TPM
+    }
+  }
+
+  if ($EnableEnhancedPIN) {
+    Set-Dword -Name 'UseEnhancedPin' -Value 1
+    Set-Dword -Name 'MinimumPIN'     -Value $MinimumPIN
+  }
+
+  # Verify
+  $adv = Get-Dword -Name 'UseAdvancedStartup'
+  $tpmpin = Get-Dword -Name 'UseTPMPIN'
+  $keypin = Get-Dword -Name 'UseTPMKeyPIN'
+
+  $ok =
+    ($adv -eq 1) -and
+    (
+      ($NetworkUnlock -and ($tpmpin -eq 2) -and ($keypin -eq 0)) -or
+      (-not $NetworkUnlock -and (
+          ($Mode -eq 'TPM+PIN' -and $tpmpin -eq 1) -or
+          ($Mode -eq 'Key+PIN' -and $keypin -eq 1)
+      ))
+    )
+
+  if ($ok) {
+    Write-Host "Remediation success. UseAdvancedStartup=1; Mode=$Mode; NetworkUnlock=$NetworkUnlock."
+    if ($EnableEnhancedPIN) {
+      $u = Get-Dword -Name 'UseEnhancedPin'
+      $m = Get-Dword -Name 'MinimumPIN'
+      Write-Host "Enhanced PINs enabled (UseEnhancedPin=$u), MinimumPIN=$m."
+    }
+    Write-Host "Note: To apply to an already-encrypted OS drive, add a matching protector (e.g., 'manage-bde -protectors -add C: -TPMAndPIN')."
+    exit 0
+  } else {
+    Write-Error "Verification failed. Current values: UseAdvancedStartup=$adv, UseTPMPIN=$tpmpin, UseTPMKeyPIN=$keypin"
+    exit 2
+  }
+}
+catch {
+  Write-Error "Unhandled error: $($_.Exception.Message)"
+  exit 3
+}
