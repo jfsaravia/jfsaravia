@@ -1,0 +1,126 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN10-CC-000195
+    Biometrics > Facial Features > "Configure enhanced anti-spoofing" = Enabled.
+    Sets HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures\EnhancedAntiSpoofing = 1.
+    Includes -Revert to disable (lab-only), plus simple logging and Windows Event Log entries.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-09-15
+    Last Modified   : 2025-09-18
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable STIG audit item for Enhanced Anti-Spoofing (Win10)
+    STIG-ID         : WN10-CC-000195 (Configure enhanced anti-spoofing = Enabled)
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-16
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro 22H2
+    PowerShell Ver. : 5.1+
+
+.USAGE
+    Enforce (Enabled = 1):
+      PS C:\> .\Set-EnhancedAntiSpoofing.ps1
+
+    Revert (Disabled = 0, non-compliant; lab only):
+      PS C:\> .\Set-EnhancedAntiSpoofing.ps1 -Revert
+
+    Verify (registry):
+      PS C:\> reg query "HKLM\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures" /v EnhancedAntiSpoofing
+
+    Note:
+      Enabling this may disable Windows Hello Face on devices that do not support enhanced anti-spoofing.
+#>
+
+param(
+  [switch]$Revert,
+  [string]$EventSource = "STIG-WN10-CC-000195",
+  [string]$EventLog    = "Application",
+  [string]$LogPath     = "$env:ProgramData\STIG-WN10-CC-000195.log"
+)
+
+# Exit codes: 0=success, 1=not elevated, 2=verification failed, 3=unhandled error
+
+# Admin check
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+# Policy registry (Computer Configuration > Administrative Templates > Windows Components > Biometrics > Facial Features)
+$RegPath   = 'HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures'
+$ValueName = 'EnhancedAntiSpoofing'
+# STIG requires Enabled (1). Revert sets 0.
+$Desired   = if ($Revert) { 0 } else { 1 }
+
+# Logging helpers
+function Write-FileLog([string]$Message) {
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts  $Message" | Tee-Object -FilePath $LogPath -Append | Out-Null
+}
+function Ensure-EventSource {
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+      New-EventLog -LogName $EventLog -Source $EventSource -ErrorAction Stop
+    }
+  } catch { Write-FileLog "Warn: could not create event source. $_" }
+}
+function Write-CentralEvent([int]$Id,[ValidateSet('Information','Warning','Error')][string]$Type,[string]$Msg) {
+  try { Write-EventLog -LogName $EventLog -Source $EventSource -EventId $Id -EntryType $Type -Message $Msg }
+  catch { Write-FileLog "Warn: event write failed. $_" }
+}
+
+# Registry helpers
+function Ensure-Key { if (-not (Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null } }
+function Get-Value {
+  try { (Get-ItemProperty -Path $RegPath -Name $ValueName -ErrorAction Stop).$ValueName } catch { $null }
+}
+function Set-Value([int]$Value) {
+  Ensure-Key
+  New-ItemProperty -Path $RegPath -Name $ValueName -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+Ensure-EventSource
+Write-FileLog "Start WN10-CC-000195. Revert=$Revert Desired=$Desired"
+Write-CentralEvent 1000 "Information" "Start WN10-CC-000195. Revert=$Revert Desired=$Desired"
+
+try {
+  $before = Get-Value
+  if ($null -ne $before) { Write-FileLog "Current $ValueName=$before" } else { Write-FileLog "Current $ValueName not present." }
+
+  if ($before -ne $Desired) {
+    Set-Value -Value $Desired
+  }
+
+  $after = Get-Value
+  if ($after -eq $Desired) {
+    $state = if ($Desired -eq 1) { "Enabled (compliant)" } else { "Disabled (reverted for lab)" }
+    $msg = "Remediation success. $ValueName=$after ($state). Run gpupdate /force or reboot to ensure full application."
+    Write-Host $msg
+    Write-FileLog $msg
+    Write-CentralEvent 1100 "Information" $msg
+    exit 0
+  } else {
+    $msg = "Verification failed. Expected $Desired, found $after."
+    Write-Error $msg
+    Write-FileLog $msg
+    Write-CentralEvent 1200 "Error" $msg
+    exit 2
+  }
+}
+catch {
+  $msg = "Unhandled error: $($_.Exception.Message)"
+  Write-Error $msg
+  Write-FileLog $msg
+  Write-CentralEvent 1300 "Error" $msg
+  exit 3
+}
+finally {
+  Write-FileLog "Finished remediation attempt."
+  Write-CentralEvent 1002 "Information" "Finished remediation attempt."
+}
