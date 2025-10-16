@@ -1,0 +1,163 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN10-CC-000335 by enforcing:
+    WinRM Client -> "Allow unencrypted traffic" = Disabled.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-09-28
+    Last Modified   : 2025-10-12
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Tenable STIG audit item for WN10-CC-000335
+    STIG-ID         : WN10-CC-000335
+
+.PARAMETER Revert
+    Sets the policy value to Enabled (Allow) for lab rollback.
+    Default behavior without -Revert is Disabled (Do not allow).
+
+.PARAMETER AlsoSetRuntime
+    Also set the live WSMan client (and service) configuration:
+      WSMan:\localhost\Client\AllowUnencrypted
+      WSMan:\localhost\Service\AllowUnencrypted
+    This mirrors the policy at runtime. Optional.
+
+.PARAMETER EventSource
+    Windows Event Log source name. Default: STIG-WN10-CC-000335
+
+.PARAMETER EventLog
+    Windows Event Log name. Default: Application
+
+.PARAMETER LogPath
+    Local log file path. Default: C:\ProgramData\STIG-WN10-CC-000335.log
+
+.TESTED ON
+    Date(s) Tested  : 2025-10-16
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 10 Pro 22H2
+    PowerShell Ver. : 5.1+
+
+.USAGE
+    Enforce (Disabled = Do not allow unencrypted traffic):
+      PS C:\> .\Set-WinRMClient-UnencryptedTraffic.ps1
+
+    Revert (Enable allowing unencrypted traffic; non-compliant, lab only):
+      PS C:\> .\Set-WinRMClient-UnencryptedTraffic.ps1 -Revert
+
+    Also set runtime WSMan to match policy:
+      PS C:\> .\Set-WinRMClient-UnencryptedTraffic.ps1 -AlsoSetRuntime
+
+    Verify registry:
+      PS C:\> reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client" /v AllowUnencryptedTraffic
+#>
+
+param(
+  [switch]$Revert,
+  [switch]$AlsoSetRuntime,
+  [string]$EventSource = "STIG-WN10-CC-000335",
+  [string]$EventLog    = "Application",
+  [string]$LogPath     = "$env:ProgramData\STIG-WN10-CC-000335.log"
+)
+
+# Exit codes: 0=success, 1=not elevated, 2=verification failed, 3=unhandled error
+
+# Admin check
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  Write-Error "Run this script as Administrator."
+  exit 1
+}
+
+# Policy registry (Computer Configuration > Administrative Templates > Windows Components > WinRM > WinRM Client)
+$RegPath   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'
+$ValueName = 'AllowUnencryptedTraffic'
+# STIG requires Disabled (0). Revert sets 1 to allow unencrypted.
+$Desired   = if ($Revert) { 1 } else { 0 }
+
+# Logging helpers
+function Write-FileLog([string]$Message) {
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts  $Message" | Tee-Object -FilePath $LogPath -Append | Out-Null
+}
+function Ensure-EventSource {
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+      New-EventLog -LogName $EventLog -Source $EventSource -ErrorAction Stop
+    }
+  } catch { Write-FileLog "Warn: could not create event source. $_" }
+}
+function Write-CentralEvent([int]$Id,[ValidateSet('Information','Warning','Error')][string]$Type,[string]$Msg) {
+  try { Write-EventLog -LogName $EventLog -Source $EventSource -EventId $Id -EntryType $Type -Message $Msg }
+  catch { Write-FileLog "Warn: event write failed. $_" }
+}
+
+# Registry helpers
+function Ensure-Key { if (-not (Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null } }
+function Get-Value {
+  try { (Get-ItemProperty -Path $RegPath -Name $ValueName -ErrorAction Stop).$ValueName } catch { $null }
+}
+function Set-Value([int]$Value) {
+  Ensure-Key
+  New-ItemProperty -Path $RegPath -Name $ValueName -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+# Optional runtime WSMan setters
+function Set-WSManRuntime([bool]$Allow) {
+  try {
+    if (Test-Path WSMan:\localhost\Client) {
+      Set-Item -Path WSMan:\localhost\Client\AllowUnencrypted  -Value $Allow -Force
+    }
+    if (Test-Path WSMan:\localhost\Service) {
+      Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $Allow -Force
+    }
+  } catch {
+    Write-FileLog "Warn: failed to set WSMan runtime AllowUnencrypted. $_"
+    Write-CentralEvent 1400 "Warning" "Failed to set WSMan runtime AllowUnencrypted."
+  }
+}
+
+Ensure-EventSource
+Write-FileLog "Start WN10-CC-000335. Revert=$Revert Desired=$Desired AlsoSetRuntime=$AlsoSetRuntime"
+Write-CentralEvent 1000 "Information" "Start WN10-CC-000335. Revert=$Revert Desired=$Desired"
+
+try {
+  $before = Get-Value
+  if ($null -ne $before) { Write-FileLog "Current $ValueName=$before" } else { Write-FileLog "Current $ValueName not present." }
+
+  if ($before -ne $Desired) {
+    Set-Value -Value $Desired
+  }
+
+  if ($AlsoSetRuntime) {
+    Set-WSManRuntime -Allow:([bool]$Desired)
+  }
+
+  $after = Get-Value
+  if ($after -eq $Desired) {
+    $state = if ($Desired -eq 0) { "Disabled (compliant)" } else { "Enabled (reverted for lab)" }
+    $msg = "Remediation success. $ValueName=$after ($state). Run gpupdate /force or reboot to ensure full application."
+    Write-Host $msg
+    Write-FileLog $msg
+    Write-CentralEvent 1100 "Information" $msg
+    exit 0
+  } else {
+    $msg = "Verification failed. Expected $Desired, found $after."
+    Write-Error $msg
+    Write-FileLog $msg
+    Write-CentralEvent 1200 "Error" $msg
+    exit 2
+  }
+}
+catch {
+  $msg = "Unhandled error: $($_.Exception.Message)"
+  Write-Error $msg
+  Write-FileLog $msg
+  Write-CentralEvent 1300 "Error" $msg
+  exit 3
+}
+finally {
+  Write-FileLog "Finished remediation attempt."
+  Write-CentralEvent 1002 "Information" "Finished remediation attempt."
+}
