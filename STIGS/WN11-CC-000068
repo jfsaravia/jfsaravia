@@ -1,0 +1,189 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN11-CC-000068 by enabling
+    "Remote host allows delegation of non-exportable credentials".
+
+.DESCRIPTION
+    Configures the Group Policy registry equivalent for:
+      Computer Configuration\Administrative Templates\System\Credentials Delegation
+        -> Remote host allows delegation of non-exportable credentials
+
+    Registry setting:
+      HKLM\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation
+        AllowProtectedCreds (REG_DWORD)
+
+    Values:
+      Enabled       -> 1  (Compliant per STIG WN11-CC-000068)
+      Disabled      -> 0
+      NotConfigured -> value deleted
+
+    Why this matters:
+      Enabling this setting allows delegation of *non-exportable* credentials
+      (e.g., via CredSSP / Remote Credential Guard scenarios) so credentials
+      cannot be extracted from the remote host, reducing theft risk vs
+      traditional credential delegation.
+
+.PARAMETER State
+    Desired state for AllowProtectedCreds. Accepts: Enabled, Disabled, NotConfigured.
+    - Enabled: Sets AllowProtectedCreds = 1 (compliant).
+    - Disabled: Sets AllowProtectedCreds = 0.
+    - NotConfigured: Removes the registry value.
+
+.PARAMETER Backup
+    Export the relevant registry key to a .reg file before making changes.
+    Provides a safe rollback point for audits or testing.
+
+.PARAMETER WhatIf
+    Shows what the script would change without applying it. Useful for dry runs.
+
+.PARAMETER Confirm
+    Prompts for confirmation before changes. Adds an extra safeguard.
+
+.EXAMPLES
+    # Enforce STIG (recommended)
+    .\Remediate-WN11-CC-000068-RemoteHost-AllowProtectedCreds.ps1 -State Enabled -Backup
+
+    # Explicitly disable
+    .\Remediate-WN11-CC-000068-RemoteHost-AllowProtectedCreds.ps1 -State Disabled
+
+    # Revert to Not Configured
+    .\Remediate-WN11-CC-000068-RemoteHost-AllowProtectedCreds.ps1 -State NotConfigured
+
+.COMPATIBILITY NOTES
+    Verified on: Windows 11 Pro 23H2 (Azure VM) and Windows 11 Enterprise.
+    This setting is Computer-scope only; no per-user registry is required.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-11-02
+    Last Modified   : 2025-11-06
+    Version         : 1.0
+    STIG-ID         : WN11-CC-000068
+    Policy Path     : Computer Config\Administrative Templates\System\Credentials Delegation
+    Risk Note       : Disabling may break scenarios requiring protected credential delegation.
+                      Enabling improves security posture vs classic delegation.
+
+.TESTED ON
+    Date(s) Tested  : 2025-11-07
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 11 Pro/Enterprise
+    PowerShell Ver. : 5.1 and 7.x
+
+.USAGE
+    Run in an elevated PowerShell session.
+    Example:
+      PS C:\> .\Remediate-WN11-CC-000068-RemoteHost-AllowProtectedCreds.ps1 -State Enabled -Backup
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Enabled','Disabled','NotConfigured')]
+    [string]$State,
+
+    [switch]$Backup
+)
+
+function Write-Info($m){ Write-Host "[INFO]  $m" }
+function Write-Ok($m)  { Write-Host "[OK]    $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Warning $m }
+function Write-Err($m) { Write-Host "[ERROR] $m" -ForegroundColor Red }
+
+# Constants
+$BaseKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation'
+$RegExport = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation'
+$ValueName = 'AllowProtectedCreds'
+
+function Backup-Key {
+    param([string]$RegPathForExport,[string]$Suffix)
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $safe = ($RegPathForExport -replace '[\\/:*?"<>|]','_')
+    $outfile = Join-Path $PSScriptRoot ("Backup_{0}_{1}_{2}.reg" -f $safe,$Suffix,$ts)
+    Write-Info "Backing up $RegPathForExport -> $outfile"
+    reg.exe export $RegPathForExport $outfile /y | Out-Null
+    if (Test-Path $outfile) { Write-Ok "Backup created." } else { Write-Warn "Backup failed for $RegPathForExport" }
+}
+
+try {
+    # Elevated check
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "This script must be run as Administrator."
+    }
+
+    Write-Info "STIG: WN11-CC-000068 | Target State: $State"
+
+    if ($Backup) { Backup-Key -RegPathForExport $RegExport -Suffix 'MACHINE' }
+
+    switch ($State) {
+        'NotConfigured' {
+            if (Test-Path $BaseKey) {
+                $prop = Get-ItemProperty -Path $BaseKey -Name $ValueName -ErrorAction SilentlyContinue
+                if ($null -ne $prop) {
+                    if ($PSCmdlet.ShouldProcess("$BaseKey\$ValueName",'Delete value')) {
+                        Remove-ItemProperty -Path $BaseKey -Name $ValueName -ErrorAction SilentlyContinue
+                        Write-Ok "Deleted $ValueName (NotConfigured)."
+                    }
+                } else {
+                    Write-Info "$ValueName not present (already NotConfigured)."
+                }
+            } else {
+                Write-Info "Key not present (already NotConfigured)."
+            }
+        }
+
+        'Enabled' {
+            if (-not (Test-Path $BaseKey)) {
+                if ($PSCmdlet.ShouldProcess($BaseKey,'Create key')) {
+                    New-Item -Path $BaseKey -Force | Out-Null
+                }
+            }
+            if ($PSCmdlet.ShouldProcess("$BaseKey\$ValueName",'Set to 1 (Enabled)')) {
+                New-ItemProperty -Path $BaseKey -Name $ValueName -PropertyType DWord -Value 1 -Force | Out-Null
+                Write-Ok "$ValueName = 1 (Enabled)."
+            }
+        }
+
+        'Disabled' {
+            if (-not (Test-Path $BaseKey)) {
+                if ($PSCmdlet.ShouldProcess($BaseKey,'Create key')) {
+                    New-Item -Path $BaseKey -Force | Out-Null
+                }
+            }
+            if ($PSCmdlet.ShouldProcess("$BaseKey\$ValueName",'Set to 0 (Disabled)')) {
+                New-ItemProperty -Path $BaseKey -Name $ValueName -PropertyType DWord -Value 0 -Force | Out-Null
+                Write-Ok "$ValueName = 0 (Disabled)."
+            }
+        }
+    }
+
+    # Verification
+    Write-Info "Verifying..."
+    $expected = switch ($State) {
+        'Enabled'       { 1 }
+        'Disabled'      { 0 }
+        'NotConfigured' { $null }
+    }
+
+    $current = $null
+    if (Test-Path $BaseKey) {
+        $prop = Get-ItemProperty -Path $BaseKey -Name $ValueName -ErrorAction SilentlyContinue
+        if ($null -ne $prop) { $current = [int]$prop.$ValueName }
+    }
+
+    $status = if ($State -eq 'NotConfigured') {
+        if ($null -eq $current) { 'OK' } else { 'Mismatch' }
+    } else {
+        if ($current -eq $expected) { 'OK' } else { 'Mismatch' }
+    }
+
+    Write-Host ("{0} -> Value: {1}  Expected: {2}  Status: {3}" -f $BaseKey, ($current -as [string]), ($expected -as [string]), $status)
+    if ($status -eq 'OK') { Write-Ok "Verification passed." } else { Write-Err "Verification failed." }
+
+} catch {
+    Write-Err $_.Exception.Message
+    exit 1
+}
