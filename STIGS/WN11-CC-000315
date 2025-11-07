@@ -1,0 +1,332 @@
+<#
+.SYNOPSIS
+    Remediate STIG WN11-CC-000315 by disabling "Always install with elevated privileges".
+
+.DESCRIPTION
+    Configures the Group Policy registry equivalents for:
+      Computer Configuration\Administrative Templates\Windows Components\Windows Installer
+        -> Always install with elevated privileges
+      User Configuration\Administrative Templates\Windows Components\Windows Installer
+        -> Always install with elevated privileges
+
+    Registry settings:
+      Machine (Computer Policy)
+        HKLM\Software\Policies\Microsoft\Windows\Installer
+          AlwaysInstallElevated (REG_DWORD)
+      User (User Policy)
+        HKCU\Software\Policies\Microsoft\Windows\Installer
+          AlwaysInstallElevated (REG_DWORD)
+
+    Values:
+      Enabled       -> 1  (Noncompliant; high risk)
+      Disabled      -> 0  (Compliant per STIG WN11-CC-000315)
+      NotConfigured -> value deleted
+
+    Why this matters:
+      When enabled, any MSI installation can run with elevated SYSTEM privileges,
+      allowing standard users to execute arbitrary code as SYSTEM via crafted MSI packages.
+      STIG requires this setting to be Disabled (0) for BOTH Computer and User scopes.
+
+.PARAMETER State
+    Desired state for AlwaysInstallElevated. Accepts: Enabled, Disabled, NotConfigured.
+    - Enabled: Sets AlwaysInstallElevated to 1 (not compliant; only for testing or rollback).
+    - Disabled: Sets AlwaysInstallElevated to 0 (compliant).
+    - NotConfigured: Removes the value.
+
+.PARAMETER Target
+    Which policy scope(s) to modify. Accepts: Machine, User, Both. Default: Both.
+    Use Both to align with STIG guidance that requires disabling in both scopes.
+
+.PARAMETER AllUsers
+    When modifying the User scope, also apply to all currently loaded user profiles
+    under HKEY_USERS (SIDs like S-1-5-xx and .DEFAULT). This covers service and system hives
+    seen by scanners and agents.
+
+.PARAMETER IncludeOfflineProfiles
+    Load each offline user profile under C:\Users, set AlwaysInstallElevated=0 in its NTUSER.DAT,
+    and unload the hive. This ensures compliance for profiles not currently loaded, which some
+    scanners still evaluate. Recommended on multi-user systems and in VM templates.
+
+.PARAMETER ProfileRoot
+    Base folder containing profiles to scan for NTUSER.DAT when IncludeOfflineProfiles is used.
+    Default: C:\Users
+
+.PARAMETER Backup
+    Export the relevant registry keys to .reg files before making changes.
+    Provides a safe rollback point for audits or testing.
+
+.PARAMETER WhatIf
+    Show what the script would change without applying it. Helpful for dry runs.
+
+.PARAMETER Confirm
+    Prompt for confirmation before changes. Adds an extra safeguard.
+
+.EXAMPLES
+    # Enforce STIG fully and cover offline profiles
+    .\Remediate-WN11-CC-000315-AlwaysInstallElevated.ps1 -State Disabled -Target Both -AllUsers -IncludeOfflineProfiles -Backup
+
+    # Disable only at the machine scope
+    .\Remediate-WN11-CC-000315-AlwaysInstallElevated.ps1 -State Disabled -Target Machine
+
+    # Remove explicit settings (not configured) for current user and machine
+    .\Remediate-WN11-CC-000315-AlwaysInstallElevated.ps1 -State NotConfigured -Target Both
+
+.COMPATIBILITY NOTES
+    Verified on:
+      Windows 11 Pro 23H2, OS build 22631.6060 (Azure VM)
+    Rationale:
+      Some scanners and agents evaluate user hives that are not currently loaded. On such systems,
+      Tenable may continue to flag WN11-CC-000315 as failed unless AlwaysInstallElevated is set to 0
+      in both loaded hives (HKEY_USERS) and offline profile hives. The IncludeOfflineProfiles option
+      addresses this by loading NTUSER.DAT for each profile and applying the value.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-11-01
+    Last Modified   : 2025-11-06
+    Version         : 1.1
+    STIG-ID         : WN11-CC-000315
+    CIS Mapping     : Windows Installer – Always install with elevated privileges = Disabled
+    Risk Note       : Enabling AlwaysInstallElevated lets standard users run MSI packages as SYSTEM.
+                      Must be Disabled for both Machine and User scopes.
+
+.TESTED ON
+    Date(s) Tested  : 2025-11-06
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 11 Pro/Enterprise, Windows Server 2022
+    PowerShell Ver. : 5.1
+
+.USAGE
+    Run in an elevated PowerShell session.
+    Example:
+      PS C:\> .\Remediate-WN11-CC-000315-AlwaysInstallElevated.ps1 -State Disabled -Target Both -AllUsers -IncludeOfflineProfiles -Backup
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Enabled','Disabled','NotConfigured')]
+    [string]$State,
+
+    [ValidateSet('Machine','User','Both')]
+    [string]$Target = 'Both',
+
+    [switch]$AllUsers,
+    [switch]$IncludeOfflineProfiles,
+
+    [string]$ProfileRoot = 'C:\Users',
+
+    [switch]$Backup
+)
+
+function Write-Info($m){ Write-Host "[INFO]  $m" }
+function Write-Ok($m)  { Write-Host "[OK]    $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Warning $m }
+function Write-Err($m) { Write-Host "[ERROR] $m" -ForegroundColor Red }
+
+# Constants
+$MachineKey = 'HKLM:\Software\Policies\Microsoft\Windows\Installer'
+$UserKeyCU  = 'HKCU:\Software\Policies\Microsoft\Windows\Installer'
+$UserKeySUF = 'Software\Policies\Microsoft\Windows\Installer' # for HKEY_USERS\<SID>\...
+$ValueName  = 'AlwaysInstallElevated'
+
+function Set-PolicyValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$KeyPath,
+        [Parameter(Mandatory)]
+        [ValidateSet('Enabled','Disabled','NotConfigured')]
+        [string]$DesiredState
+    )
+
+    if ($DesiredState -eq 'NotConfigured') {
+        if (Test-Path $KeyPath) {
+            $has = Get-ItemProperty -Path $KeyPath -Name $ValueName -ErrorAction SilentlyContinue
+            if ($null -ne $has) {
+                if ($PSCmdlet.ShouldProcess("$KeyPath\$ValueName",'Delete value')) {
+                    Remove-ItemProperty -Path $KeyPath -Name $ValueName -ErrorAction SilentlyContinue
+                    Write-Ok "Deleted $ValueName at $KeyPath (NotConfigured)."
+                }
+            } else {
+                Write-Info "$ValueName absent at $KeyPath (already NotConfigured)."
+            }
+        } else {
+            Write-Info "Key not present: $KeyPath (already NotConfigured)."
+        }
+        return
+    }
+
+    # Ensure key exists
+    if (-not (Test-Path $KeyPath)) {
+        if ($PSCmdlet.ShouldProcess($KeyPath,'Create key')) {
+            New-Item -Path $KeyPath -Force | Out-Null
+        }
+    }
+
+    $val = if ($DesiredState -eq 'Enabled') { 1 } else { 0 }
+    if ($PSCmdlet.ShouldProcess("$KeyPath\$ValueName","Set to $val ($DesiredState)")) {
+        New-ItemProperty -Path $KeyPath -Name $ValueName -PropertyType DWord -Value $val -Force | Out-Null
+        Write-Ok "Set $ValueName = $val at $KeyPath ($DesiredState)."
+    }
+}
+
+function Backup-Key {
+    param([string]$RegPathForExport,[string]$Suffix)
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $safe = ($RegPathForExport -replace '[\\/:*?"<>|]','_')
+    $outfile = Join-Path $PSScriptRoot ("Backup_{0}_{1}_{2}.reg" -f $safe,$Suffix,$ts)
+    Write-Info "Backing up $RegPathForExport -> $outfile"
+    reg.exe export $RegPathForExport $outfile /y | Out-Null
+    if (Test-Path $outfile) { Write-Ok "Backup created." } else { Write-Warn "Backup failed for $RegPathForExport" }
+}
+
+function Set-UserPolicyForLoadedHives {
+    Write-Info "Applying user policy to loaded HKEY_USERS hives."
+    $targets = Get-ChildItem Registry::HKEY_USERS |
+      Where-Object { $_.Name -match '^HKEY_USERS\\(S-1-5-|\.DEFAULT$)' -and $_.Name -notmatch '\\Classes$' }
+
+    foreach ($sid in $targets) {
+        $userPolicyKey = "Registry::$($sid.Name)\$UserKeySUF"
+        Set-PolicyValue -KeyPath $userPolicyKey -DesiredState $State
+    }
+}
+
+function Set-UserPolicyForOfflineProfiles {
+    param(
+        [string]$Root = 'C:\Users'
+    )
+
+    Write-Info "Applying user policy to offline profiles under $Root."
+    if (-not (Test-Path $Root)) {
+        Write-Warn "Profile root not found: $Root"
+        return
+    }
+
+    $exclude = @('All Users','Default','Default User','Public','WDAGUtilityAccount')
+    $profiles = Get-ChildItem $Root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $exclude }
+
+    foreach ($p in $profiles) {
+        $ntuser = Join-Path $p.FullName 'NTUSER.DAT'
+        if (-not (Test-Path $ntuser)) {
+            Write-Info "Skipping $($p.Name) because NTUSER.DAT is not present."
+            continue
+        }
+
+        $mount = "HKU\TempHive_$($p.Name)"
+        try {
+            Write-Info "Loading hive for $($p.Name)"
+            reg.exe load $mount $ntuser | Out-Null
+
+            $key = "Registry::$mount\$UserKeySUF"
+            Set-PolicyValue -KeyPath $key -DesiredState $State
+            Write-Ok "Applied $ValueName for offline profile: $($p.Name)"
+        }
+        catch {
+            Write-Err "Failed to load or set hive for $($p.Name): $($_.Exception.Message)"
+        }
+        finally {
+            # Always attempt to unload to avoid leaving a locked hive
+            reg.exe unload $mount | Out-Null
+        }
+    }
+}
+
+try {
+    # Elevated check
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "This script must be run as Administrator."
+    }
+
+    Write-Info "STIG: WN11-CC-000315 | Target: $Target | State: $State | AllUsers: $AllUsers | IncludeOfflineProfiles: $IncludeOfflineProfiles"
+
+    # Optional backups
+    if ($Backup) {
+        if ($Target -in @('Machine','Both')) {
+            Backup-Key -RegPathForExport 'HKLM\Software\Policies\Microsoft\Windows\Installer' -Suffix 'MACHINE'
+        }
+        if ($Target -in @('User','Both')) {
+            Backup-Key -RegPathForExport 'HKCU\Software\Policies\Microsoft\Windows\Installer' -Suffix 'USER_CURRENT'
+            # Loaded hives will be handled per hive
+        }
+    }
+
+    # Apply settings
+    if ($Target -in @('Machine','Both')) {
+        Set-PolicyValue -KeyPath $MachineKey -DesiredState $State
+    }
+
+    if ($Target -in @('User','Both')) {
+        Set-PolicyValue -KeyPath $UserKeyCU -DesiredState $State
+        if ($AllUsers) {
+            Set-UserPolicyForLoadedHives
+        }
+        if ($IncludeOfflineProfiles) {
+            Set-UserPolicyForOfflineProfiles -Root $ProfileRoot
+        }
+    }
+
+    # Verification
+    Write-Info "Verifying..."
+    $expected = switch ($State) {
+        'Enabled'       { 1 }
+        'Disabled'      { 0 }
+        'NotConfigured' { $null }
+    }
+
+    $results = @()
+
+    if ($Target -in @('Machine','Both')) {
+        $val = $null
+        if (Test-Path $MachineKey) {
+            $p = Get-ItemProperty -Path $MachineKey -Name $ValueName -ErrorAction SilentlyContinue
+            if ($null -ne $p) { $val = [int]$p.$ValueName }
+        }
+        $results += [pscustomobject]@{ Scope='Machine'; Key=$MachineKey; Value=$val; Expected=$expected }
+    }
+
+    if ($Target -in @('User','Both')) {
+        # Current user
+        $val = $null
+        if (Test-Path $UserKeyCU) {
+            $p = Get-ItemProperty -Path $UserKeyCU -Name $ValueName -ErrorAction SilentlyContinue
+            if ($null -ne $p) { $val = [int]$p.$ValueName }
+        }
+        $results += [pscustomobject]@{ Scope='User(Current)'; Key=$UserKeyCU; Value=$val; Expected=$expected }
+
+        # Loaded hives verification
+        if ($AllUsers) {
+            $targets = Get-ChildItem Registry::HKEY_USERS |
+              Where-Object { $_.Name -match '^HKEY_USERS\\(S-1-5-|\.DEFAULT$)' -and $_.Name -notmatch '\\Classes$' }
+            foreach ($sid in $targets) {
+                $key = "Registry::$($sid.Name)\$UserKeySUF"
+                $v = $null
+                if (Test-Path $key) {
+                    $p = Get-ItemProperty -Path $key -Name $ValueName -ErrorAction SilentlyContinue
+                    if ($null -ne $p) { $v = [int]$p.$ValueName }
+                }
+                $results += [pscustomobject]@{ Scope=("UserLoaded(" + $sid.PSChildName + ")"); Key=$key; Value=$v; Expected=$expected }
+            }
+        }
+    }
+
+    $allOk = $true
+    foreach ($r in $results) {
+        $status = if ($State -eq 'NotConfigured') {
+            if ($null -eq $r.Value) { 'OK' } else { 'Mismatch' }
+        } else {
+            if ($r.Value -eq $r.Expected) { 'OK' } else { 'Mismatch' }
+        }
+        if ($status -ne 'OK') { $allOk = $false }
+        Write-Host ("{0,-18} {1} -> Value: {2}  Expected: {3}  Status: {4}" -f $r.Scope, $r.Key, ($r.Value -as [string]), ($r.Expected -as [string]), $status)
+    }
+
+    if ($allOk) { Write-Ok "Verification passed for targeted scopes." } else { Write-Err "Verification failed on one or more targeted scopes." }
+
+} catch {
+    Write-Err $_.Exception.Message
+    exit 1
+}
