@@ -1,0 +1,203 @@
+<#
+.SYNOPSIS
+    Prevents passwords from being saved in Remote Desktop Connection Client (mstsc.exe).
+    Configures the policy equivalent of:
+    "Do not allow passwords to be saved" = Enabled
+
+.DESCRIPTION
+    This script enforces secure behavior for Remote Desktop by configuring:
+        HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
+            DisablePasswordSaving (REG_DWORD) = 1
+
+    When enabled:
+        - Disables saving credentials in RDP client
+        - Removes ability to store passwords in .rdp files
+        - Helps protect shared or sensitive systems from credential theft
+
+    Includes support for audit-only mode (default), remediation, and quiet mode.
+
+.NOTES
+    Author          : Juan Saravia
+    LinkedIn        : linkedin.com/in/juan-francisco-saravia-300634233/
+    GitHub          : github.com/Jsaravia
+    Date Created    : 2025-11-18
+    Last Modified   : 2025-11-25
+    Version         : 1.0
+    CVEs            : N/A
+    Plugin IDs      : Related to STIG audit items for credential storage hardening
+    STIG-ID         : WN11-CC-000270 (Do not allow passwords to be saved)
+
+.TESTED ON
+    Date(s) Tested  : 2025-11-25
+    Tested By       : Juan Saravia
+    Systems Tested  : Windows 11 Pro 24H2 
+    PowerShell Ver. : 5.1, 7.4.x
+
+.USAGE
+    Run in an elevated PowerShell session.
+
+    Audit only (no changes):
+        PS C:\> .\PreventSavingPWD.ps1
+
+    Enforce setting (prevent password saving):
+        PS C:\> .\PreventSavingPWD.ps1 -Remediate
+
+    Enforce with verbose output:
+        PS C:\> .\PreventSavingPWD.ps1 -Remediate -Verbose
+
+    Dry run (see what would change without modifying system):
+        PS C:\> .\PreventSavingPWD.ps1 -Remediate -WhatIf
+
+    Silent enforcement (minimal console output):
+        PS C:\> .\PreventSavingPWD.ps1 -Remediate -Quiet -Confirm:$false
+
+    Verification (manual):
+        PS C:\> reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v DisablePasswordSaving
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [switch]$Remediate,
+    [switch]$Quiet
+)
+
+# --------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------
+$SettingName   = 'Do not allow passwords to be saved'
+$BaseKey       = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+$ValueName     = 'DisablePasswordSaving'
+$ExpectedValue = 1
+$ValueType     = 'DWord'
+
+# --------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------
+function Write-Info {
+    param([string]$Message)
+    if (-not $Quiet) {
+        Write-Host "[INFO]  $Message"
+    }
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-Warning $Message
+}
+
+# --------------------------------------------------------------------
+# Registry read helper
+# --------------------------------------------------------------------
+function Get-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+    try {
+        if (Test-Path -Path $Path) {
+            $item = Get-ItemProperty -Path $Path -ErrorAction Stop
+            if ($item.PSObject.Properties.Match($Name)) {
+                return $item.$Name
+            }
+        }
+        return $null
+    }
+    catch {
+        Write-Warn "Unable to read '$Name' from '$Path': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# --------------------------------------------------------------------
+# Registry write helper
+# --------------------------------------------------------------------
+function Set-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [ValidateSet('String','ExpandString','DWord','QWord','Binary','MultiString')]
+        [string]$Type,
+        [object]$Value
+    )
+
+    try {
+        if (-not (Test-Path -Path $Path)) {
+            Write-Info "Creating registry key: $Path"
+            if ($PSCmdlet.ShouldProcess($Path, "Create registry key")) {
+                New-Item -Path $Path -Force | Out-Null
+            }
+        }
+
+        $target = "$Path\$Name"
+        $desc = "Set $Name to $Value (Type: $Type)"
+
+        if ($PSCmdlet.ShouldProcess($target, $desc)) {
+            $existing = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+            if ($existing) {
+                Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force
+            }
+            else {
+                New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+            }
+        }
+    }
+    catch {
+        Write-Error "Failed to set '$Name' at '$Path': $($_.Exception.Message)"
+        throw
+    }
+}
+
+# --------------------------------------------------------------------
+# Audit phase
+# --------------------------------------------------------------------
+Write-Info "Auditing system for: $SettingName"
+Write-Info "Registry Path : $BaseKey"
+Write-Info "Value Name    : $ValueName"
+
+$current = Get-RegistryValue -Path $BaseKey -Name $ValueName
+
+if ($null -eq $current) {
+    Write-Info "Current Value : <not set>"
+}
+else {
+    Write-Info "Current Value : $current"
+}
+
+$compliant = ($current -eq $ExpectedValue)
+
+if ($compliant) {
+    Write-Info "Result        : COMPLIANT"
+} else {
+    Write-Warn "Result        : NON-COMPLIANT"
+}
+
+# Object for pipeline logging
+$result = [PSCustomObject]@{
+    SettingName  = $SettingName
+    RegistryPath = $BaseKey
+    ValueName    = $ValueName
+    Expected     = $ExpectedValue
+    Current      = $current
+    Compliant    = $compliant
+    Remediated   = $false
+}
+
+# --------------------------------------------------------------------
+# Remediation phase
+# --------------------------------------------------------------------
+if ($Remediate) {
+    if ($compliant) {
+        Write-Info "No changes needed; system already compliant."
+    }
+    else {
+        Write-Info "Applying secure configuration..."
+        Set-RegistryValue -Path $BaseKey -Name $ValueName -Type $ValueType -Value $ExpectedValue
+        $result.Remediated = $true
+
+        $newValue = Get-RegistryValue -Path $BaseKey -Name $ValueName
+        Write-Info "New Value     : $newValue"
+    }
+}
+
+# Output final status
+$result
