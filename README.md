@@ -11,6 +11,7 @@ I'm passionate about cybersecurity and love tackling complex challenges through 
 ## 🚨 Threat Hunting and Security Operations
 
 - **[Threat Hunting Scenario (Tor Browser Usage)](https://github.com/jfsaravia/Threat-Event-TOR_USAGE-Hunt.md)**
+- [Threat Hunting (AZUKI)](https://github.com/jfsaravia/Threat-hunt-Azuki-Import-Export/tree/main)
 
 <hr/>
 
@@ -24,7 +25,7 @@ I'm passionate about cybersecurity and love tackling complex challenges through 
 [twitter]: https://twitter.com/___________
 [youtube]: https://www.youtube.com/c/___________
 [instagram]: https://www.instagram.com/___________
-[linkedin]: https://linkedin.com/in/___________
+[linkedin]: https://linkedin.com/in/www.linkedin.com/in/juan-francisco-saravia-300634233
 
 <!--
 <img width="35" alt="image" src="https://github.com/user-attachments/assets/2f41c7cd-5ea8-4475-b451-a37161b6c3fb"> 
