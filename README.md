@@ -12,6 +12,7 @@ I'm passionate about cybersecurity and love tackling complex challenges through 
 
 - **[Threat Hunting Scenario (Tor Browser Usage)](https://github.com/jfsaravia/Threat-Event-TOR_USAGE-Hunt.md)**
 - [Threat Hunting Scenario (AZUKI)](https://github.com/jfsaravia/Threat-hunt-Azuki-Import-Export/tree/main)
+- [Threat Hunting Scenario (CorpHealth)](https://github.com/jfsaravia/Threat-Hunting-CorpHealth-/tree/main)
 
 <hr/>
 
