@@ -35,3 +35,6 @@ I'm passionate about cybersecurity and love tackling complex challenges through 
 <img width="35" alt="image" src="https://github.com/user-attachments/assets/2f41c7cd-5ea8-4475-b451-a37161b6c3fb"> 
 <img width="35" alt="image" src="https://github.com/user-attachments/assets/77649969-9910-4994-8b96-74a116cfb2a8">
 -->
+
+## My Cybersecurity Story 🚀
+I never knew I was going to be interested in cybersecurity. Growing up, I would play computer games late into the night, even on weekdays, which got me into a lot of trouble. Finding ways to keep my parents from noticing what I was up to. As I grew up, my relationship with technology faded. Years later, after having a severe motorcycle accident at 26. Going through one of the hardest tests of my life, I received an opportunity to work in IT during my recovery. It was perfect! I didn't need to do much physical work. As time went by, I rediscovered my love for technology. The more I worked with computers, troubleshooting, systems, and users, the more I rediscovered the curiosity I had when I was younger. Once I learned about the vast field of Cybersecurity. I was motivated to go back to school and continue to grow my skills. Fast forward to now. This is the fruit of my journey. My gratitude goes out to everyone who helped me along the way. I could not do what I am doing now without your help.
